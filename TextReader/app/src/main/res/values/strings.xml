@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">TextReader</string>
+    <string name="accessibility_description">Accessibility service for reading screen content</string>
 </resources>
