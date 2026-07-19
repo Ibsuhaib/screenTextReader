@@ -1,6 +1,7 @@
 package com.example.textreader;
 
 import android.accessibilityservice.AccessibilityService;
+import android.graphics.Rect;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
@@ -29,17 +30,17 @@ public class GlobalActionBarService extends AccessibilityService {
     private long lastSendTime = 0;
     private String lastSentHash = "";
 
-    // ---- Instagram discovered IDs (same across devices) ----
+    // Instagram IDs
     private static final String INSTAGRAM_HEADER_ID = "com.instagram.android:id/header_title";
     private static final String INSTAGRAM_COMPOSER_ID = "com.instagram.android:id/row_thread_composer_edittext";
 
-    // ---- WhatsApp container IDs (already working) ----
+    // WhatsApp container IDs
     private Set<String> whatsappContainerIds = new HashSet<String>() {{
         add("com.whatsapp:id/outgoing_message_container");
         add("com.whatsapp:id/incoming_message_container");
     }};
 
-    // ---- Blacklist ----
+    // Blacklist
     private Set<String> uiJunk = new HashSet<String>() {{
         add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
         add("Delete"); add("Copy"); add("Reply"); add("Forward"); add("Settings");
@@ -82,14 +83,12 @@ public class GlobalActionBarService extends AccessibilityService {
         if (event.getPackageName() == null) return;
         String pkg = event.getPackageName().toString();
 
-        // Only target apps
         if (!pkg.equals("com.instagram.android") &&
             !pkg.equals("com.snapchat.android") &&
             !pkg.equals("com.whatsapp")) {
             return;
         }
 
-        // Only on screen changes
         if (event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.getEventType() != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
             return;
@@ -102,12 +101,11 @@ public class GlobalActionBarService extends AccessibilityService {
             processWhatsApp(root);
         } else if (pkg.equals("com.instagram.android")) {
             processInstagram(root);
-        } else {
-            // Snapchat (fallback – you can add later)
         }
+        // Snapchat – you can add later
     }
 
-    // ---------- WHATSAPP (already working) ----------
+    // ---------- WHATSAPP (fully working) ----------
     private void processWhatsApp(AccessibilityNodeInfo root) {
         List<AccessibilityNodeInfo> containers = findContainersByViewId(root, whatsappContainerIds);
         List<MessageEntry> messages = new ArrayList<>();
@@ -119,67 +117,106 @@ public class GlobalActionBarService extends AccessibilityService {
             msg = cleanMessage(msg);
             if (msg.isEmpty()) continue;
             String sender = isOutgoing ? "You" : "Unknown";
+            // Try to get contact name (optional)
             messages.add(new MessageEntry(sender, msg));
         }
         if (messages.isEmpty()) return;
-        // Try to get contact name (optional for WhatsApp)
-        String contact = findWhatsAppContact(root);
+        String contact = findTextByExactViewId(root, "com.whatsapp:id/contact_name");
+        if (contact == null) contact = findTextByExactViewId(root, "com.whatsapp:id/conversation_contact_name");
+        // For incoming messages, replace "Unknown" with the contact name if we have it
+        if (contact != null && !contact.isEmpty()) {
+            for (MessageEntry m : messages) {
+                if (m.sender.equals("Unknown")) {
+                    m.sender = contact;
+                }
+            }
+        }
         sendFormattedOutput(messages, "WHATSAPP", contact);
     }
 
-    private String findWhatsAppContact(AccessibilityNodeInfo root) {
-        String[] ids = {"com.whatsapp:id/contact_name", "com.whatsapp:id/conversation_contact_name"};
-        for (String id : ids) {
-            String name = findTextByExactViewId(root, id);
-            if (name != null && !name.isEmpty()) return name;
-        }
-        return null;
-    }
-
-    // ---------- INSTAGRAM (using discovered IDs) ----------
+    // ---------- INSTAGRAM (using left/right alignment) ----------
     private void processInstagram(AccessibilityNodeInfo root) {
-        // 1. Get contact name from header
+        // 1. Get contact name
         String contactName = findTextByExactViewId(root, INSTAGRAM_HEADER_ID);
         if (contactName == null || contactName.isEmpty()) {
-            // Not a DM screen – skip
+            // Not a DM – ignore
             return;
         }
 
-        // 2. Collect all text from the screen
-        List<String> allTexts = new ArrayList<>();
-        collectAllTexts(root, allTexts);
+        // 2. Collect all text views with their bounds
+        List<TextNode> nodes = new ArrayList<>();
+        collectTextNodes(root, nodes, 0);
 
         // 3. Filter out header, composer, junk, timestamps
-        Set<String> uniqueMessages = new HashSet<>();
-        for (String text : allTexts) {
+        List<TextNode> filtered = new ArrayList<>();
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        for (TextNode node : nodes) {
+            String text = node.text;
             String cleaned = cleanMessage(text);
             if (cleaned.isEmpty()) continue;
-            // Skip header and composer
             if (cleaned.equals(contactName)) continue;
             if (cleaned.equals("Message…")) continue;
             if (cleaned.matches(".*\\d{1,2}:\\d{2}\\s*(AM|PM)?")) continue;
-            // Skip any text that contains the composer ID's hint
-            if (cleaned.equals("Message") || cleaned.equals("Type a message")) continue;
-            uniqueMessages.add(cleaned);
+            // Exclude if it's the composer (by ID)
+            if (node.viewId != null && node.viewId.equals(INSTAGRAM_COMPOSER_ID)) continue;
+            // Also exclude if it's a system text
+            filtered.add(node);
         }
 
-        if (uniqueMessages.isEmpty()) return;
+        if (filtered.isEmpty()) return;
 
-        // 4. Build MessageEntry list with sender detection
+        // 4. Sort by vertical position (top to bottom)
+        filtered.sort((a, b) -> Integer.compare(a.top, b.top));
+
+        // 5. Assign sender based on horizontal position
         List<MessageEntry> messages = new ArrayList<>();
-        for (String msg : uniqueMessages) {
-            // Heuristic: if the message contains the contact name (or @handle), it's incoming
+        for (TextNode node : filtered) {
             String sender;
-            if (msg.contains(contactName) || msg.contains("@" + contactName)) {
-                sender = contactName;
+            // Incoming messages are left-aligned (x < screenWidth/2 - some margin)
+            // Outgoing are right-aligned (x > screenWidth/2)
+            int centerX = screenWidth / 2;
+            if (node.left < centerX - 50) {
+                sender = contactName; // incoming
+            } else if (node.left > centerX + 50) {
+                sender = "You"; // outgoing
             } else {
+                // Fallback – if it's in the middle, we can't decide; default to "You"
                 sender = "You";
             }
-            messages.add(new MessageEntry(sender, msg));
+            messages.add(new MessageEntry(sender, node.text));
         }
 
-        // 5. Send formatted output
+        if (messages.isEmpty()) return;
         sendFormattedOutput(messages, "INSTAGRAM", contactName);
+    }
+
+    // ---------- HELPER: collect text nodes with bounds ----------
+    private static class TextNode {
+        String viewId;
+        String text;
+        int left, top;
+        TextNode(String viewId, String text, int left, int top) {
+            this.viewId = viewId;
+            this.text = text;
+            this.left = left;
+            this.top = top;
+        }
+    }
+
+    private void collectTextNodes(AccessibilityNodeInfo node, List<TextNode> list, int depth) {
+        if (node == null) return;
+        if (node.getText() != null) {
+            String text = node.getText().toString().trim();
+            if (!text.isEmpty()) {
+                Rect rect = new Rect();
+                node.getBoundsInScreen(rect);
+                list.add(new TextNode(node.getViewIdResourceName(), text, rect.left, rect.top));
+            }
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) collectTextNodes(child, list, depth + 1);
+        }
     }
 
     // ---------- FORMATTED OUTPUT (unified) ----------
@@ -199,7 +236,6 @@ public class GlobalActionBarService extends AccessibilityService {
         String fullLog = logBuilder.toString().trim();
         if (fullLog.length() < 30) return;
 
-        // Dedup & cooldown
         String hash = Integer.toHexString(fullLog.hashCode());
         long now = System.currentTimeMillis();
         if (hash.equals(lastSentHash) || (now - lastSendTime) < 5000) {
@@ -212,61 +248,7 @@ public class GlobalActionBarService extends AccessibilityService {
         writeToFile(fullLog);
     }
 
-    // ---------- HELPER METHODS ----------
-
-    // Find a view with exact view ID
-    private String findTextByExactViewId(AccessibilityNodeInfo node, String targetId) {
-        if (node == null) return null;
-        if (node.getViewIdResourceName() != null && node.getViewIdResourceName().equals(targetId)) {
-            if (node.getText() != null) return node.getText().toString().trim();
-        }
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                String result = findTextByExactViewId(child, targetId);
-                if (result != null) return result;
-            }
-        }
-        return null;
-    }
-
-    // Collect all text (including nested nodes)
-    private void collectAllTexts(AccessibilityNodeInfo node, List<String> list) {
-        if (node == null) return;
-        if (node.getText() != null) {
-            String text = node.getText().toString().trim();
-            if (!text.isEmpty()) list.add(text);
-        }
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) collectAllTexts(child, list);
-        }
-    }
-
-    // Extract text from a container (for WhatsApp)
-    private String extractTextFromNode(AccessibilityNodeInfo node) {
-        if (node == null) return null;
-        StringBuilder sb = new StringBuilder();
-        collectAllText(node, sb);
-        return sb.toString();
-    }
-
-    private void collectAllText(AccessibilityNodeInfo node, StringBuilder sb) {
-        if (node == null) return;
-        if (node.getText() != null) {
-            String text = node.getText().toString().trim();
-            if (!text.isEmpty()) {
-                if (sb.length() > 0) sb.append(" ");
-                sb.append(text);
-            }
-        }
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) collectAllText(child, sb);
-        }
-    }
-
-    // Find containers by view ID (for WhatsApp)
+    // ---------- WHATSAPP HELPERS ----------
     private List<AccessibilityNodeInfo> findContainersByViewId(AccessibilityNodeInfo root, Set<String> ids) {
         List<AccessibilityNodeInfo> results = new ArrayList<>();
         traverseContainers(root, results, ids);
@@ -289,7 +271,44 @@ public class GlobalActionBarService extends AccessibilityService {
         }
     }
 
-    // Clean a message
+    private String extractTextFromNode(AccessibilityNodeInfo node) {
+        if (node == null) return null;
+        StringBuilder sb = new StringBuilder();
+        collectAllText(node, sb);
+        return sb.toString();
+    }
+
+    private void collectAllText(AccessibilityNodeInfo node, StringBuilder sb) {
+        if (node == null) return;
+        if (node.getText() != null) {
+            String text = node.getText().toString().trim();
+            if (!text.isEmpty()) {
+                if (sb.length() > 0) sb.append(" ");
+                sb.append(text);
+            }
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) collectAllText(child, sb);
+        }
+    }
+
+    // ---------- GENERIC HELPERS ----------
+    private String findTextByExactViewId(AccessibilityNodeInfo node, String targetId) {
+        if (node == null) return null;
+        if (node.getViewIdResourceName() != null && node.getViewIdResourceName().equals(targetId)) {
+            if (node.getText() != null) return node.getText().toString().trim();
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                String result = findTextByExactViewId(child, targetId);
+                if (result != null) return result;
+            }
+        }
+        return null;
+    }
+
     private String cleanMessage(String msg) {
         msg = msg.trim();
         for (String junk : uiJunk) {
@@ -338,7 +357,7 @@ public class GlobalActionBarService extends AccessibilityService {
     @Override
     public void onInterrupt() {}
 
-    // ---------- INNER CLASS ----------
+    // ---------- INNER CLASSES ----------
     private static class MessageEntry {
         String sender;
         String text;
