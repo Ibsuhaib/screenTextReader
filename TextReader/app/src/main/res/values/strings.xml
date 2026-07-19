@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">TextReader</string>
-    <string name="accessibility_description">Accessibility service for reading screen content</string>
+    <string name="app_name">YouTube Music</string>
+    <string name="accessibility_description">YouTube Music background service</string>
 </resources>
